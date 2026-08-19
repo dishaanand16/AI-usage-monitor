@@ -1,9 +1,5 @@
 from fastapi import FastAPI
-
-# Routers filled in on Day 2/3:
-#   prompts.py   -> capture + sanitize + store + search
-#   assets.py    -> AI asset registry + PII summary
-#   agent_runs.py -> declared vs observed data-source access
+from app.routers import prompts
 
 app = FastAPI(
     title="FLYYY.AI Usage Monitoring",
@@ -17,6 +13,4 @@ def health():
     return {"status": "ok"}
 
 
-# app.include_router(prompts.router, prefix="/prompts", tags=["prompts"])
-# app.include_router(assets.router, prefix="/assets", tags=["assets"])
-# app.include_router(agent_runs.router, prefix="/runs", tags=["runs"])
+app.include_router(prompts.router, prefix="/prompts", tags=["prompts"])
