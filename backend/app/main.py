@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.routers import prompts
+from app.routers import prompts, agent_runs
 
 app = FastAPI(
     title="FLYYY.AI Usage Monitoring",
@@ -14,3 +14,4 @@ def health():
 
 
 app.include_router(prompts.router, prefix="/prompts", tags=["prompts"])
+app.include_router(agent_runs.router, prefix="/runs", tags=["runs"])
