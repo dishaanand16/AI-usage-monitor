@@ -1,91 +1,126 @@
 """
-Support agent runner.
+Support agent runner — LangGraph + real LLM version.
 
-A deliberately small agent (no LangGraph/LangChain framework overhead —
-see README for why) that answers a support query using two tools:
-FAQ Database and Orders Database. It is DECLARED (in ai_assets.declared_
-data_sources) to only use FAQ Database, but for order-related queries it
-will also call Orders Database — this is the seeded "unexpected access"
-case described in the brief's End-to-End Example.
+Unlike the earlier keyword-heuristic version, this agent uses a real LLM
+(via Groq) to genuinely DECIDE which tools to call based on the user's
+query. This is closer to how a production agent behaves: the model reads
+the query, reasons about what it needs, and invokes tools accordingly —
+which means "unexpected access" here is a real emergent behavior of the
+LLM's reasoning, not something we hardcoded with an if-statement.
 
-Every tool call is logged as it happens (not inferred after the fact),
-which is what lets us compute declared vs. observed access truthfully.
+We still log every tool invocation ourselves via a callback, because the
+brief specifically requires the MONITORING SYSTEM (not the LLM) to be the
+source of truth for what was actually accessed — an agent's own claims
+about what it did should not be trusted as the audit record.
 """
 
-import time
-import uuid
+import os
+from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Callable
+from dotenv import load_dotenv
+from langchain_core.tools import tool
+from langchain_core.callbacks.base import BaseCallbackHandler
+from langchain_groq import ChatGroq
+from langchain.agents import create_agent
+
+# .env lives at the project root (flyyy-ai/), three levels up from this
+# file (backend/app/services/agent_runner.py) -- resolve it explicitly so
+# this works regardless of which directory the script is run from.
+_ENV_PATH = Path(__file__).resolve().parents[3] / ".env"
+load_dotenv(dotenv_path=_ENV_PATH)
+GROQ_MODEL = "openai/gpt-oss-20b"
 
 
 # ---------------------------------------------------------------------------
-# Mock data sources (stand-ins for real DB-backed tools; swapping these for
-# real DB queries would not change the logging/observability approach).
+# Tools -- real LangChain @tool-decorated functions the LLM can choose to call.
 # ---------------------------------------------------------------------------
 
+@tool
 def faq_database_lookup(query: str) -> str:
+    """Look up general support FAQ information such as support hours,
+    policies, or shipping information."""
     return "Our support hours are 9am-6pm IST, Monday to Saturday."
 
 
-def orders_database_lookup(order_ref: str) -> str:
-    return f"Order {order_ref} was shipped 2 days ago and is out for delivery."
+@tool
+def orders_database_lookup(order_reference: str) -> str:
+    """Look up the status of a specific customer order, given an order
+    reference or general request about 'my order'."""
+    return f"Order {order_reference or 'ORD-4471'} was shipped 2 days ago and is out for delivery."
 
 
-def mock_llm_call(prompt: str) -> dict:
-    """Stand-in for a real provider call. Swap for a real Anthropic call to
-    validate against production behavior — logging shape is identical."""
-    time.sleep(0.05)
-    return {
-        "model": "claude-mock-1",
-        "text": f"Based on the context, here's the answer to: {prompt[:40]}...",
-        "usage": {"input_tokens": len(prompt.split()), "output_tokens": 18},
-    }
+TOOLS = [faq_database_lookup, orders_database_lookup]
 
 
 # ---------------------------------------------------------------------------
-# Instrumentation: every tool call and LLM call appends a structured event.
-# This is the "code instrumentation" approach from Day 1's research —
-# events are captured explicitly by the agent itself, not inferred from
-# network traffic (which a gateway alone could not achieve).
+# Monitoring callback -- this is our observability layer. It listens for
+# every tool call the agent makes and records it independently of what
+# the agent later claims in its final answer.
 # ---------------------------------------------------------------------------
+
+class ToolAccessLogger(BaseCallbackHandler):
+    def __init__(self):
+        self.accessed_sources = []
+
+    def on_tool_start(self, serialized, input_str, **kwargs):
+        tool_name = serialized.get("name", "unknown_tool")
+        source_map = {
+            "faq_database_lookup": "FAQ Database",
+            "orders_database_lookup": "Orders Database",
+        }
+        self.accessed_sources.append(source_map.get(tool_name, tool_name))
+
 
 @dataclass
 class RunEvents:
-    tool_accesses: list = field(default_factory=list)   # source names touched
+    tool_accesses: list = field(default_factory=list)
     model: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
+    final_answer: str = ""
 
 
 def run_support_agent(user_query: str) -> RunEvents:
-    events = RunEvents()
+    llm = ChatGroq(
+        model=GROQ_MODEL,
+        api_key=os.getenv("GROQ_API_KEY"),
+        temperature=0,
+    )
 
-    # Every agent run starts by consulting FAQ — this matches what's
-    # DECLARED for this asset.
-    events.tool_accesses.append("FAQ Database")
-    faq_context = faq_database_lookup(user_query)
+    agent = create_agent(llm, TOOLS)
 
-    # Simple heuristic: if the query mentions an order, the agent also
-    # reaches into Orders Database — a source it was NOT declared to use.
-    # This is intentional: it's the seeded governance-insight scenario.
-    if "order" in user_query.lower():
-        events.tool_accesses.append("Orders Database")
-        orders_context = orders_database_lookup("ORD-4471")
-        full_context = f"{faq_context} {orders_context}"
-    else:
-        full_context = faq_context
+    logger = ToolAccessLogger()
 
-    llm_response = mock_llm_call(f"{user_query}\nContext: {full_context}")
-    events.model = llm_response["model"]
-    events.input_tokens = llm_response["usage"]["input_tokens"]
-    events.output_tokens = llm_response["usage"]["output_tokens"]
+    result = agent.invoke(
+        {"messages": [("user", user_query)]},
+        config={"callbacks": [logger]},
+    )
 
-    return events
+    final_message = result["messages"][-1]
+    final_answer = final_message.content if hasattr(final_message, "content") else str(final_message)
+
+    # Token usage: pull from the last AI message's usage metadata if present.
+    input_tokens = output_tokens = 0
+    for msg in result["messages"]:
+        usage = getattr(msg, "usage_metadata", None)
+        if usage:
+            input_tokens = usage.get("input_tokens", input_tokens)
+            output_tokens = usage.get("output_tokens", output_tokens)
+
+    return RunEvents(
+        tool_accesses=logger.accessed_sources,
+        model=GROQ_MODEL,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        final_answer=final_answer,
+    )
 
 
 if __name__ == "__main__":
-    # Manual sanity check — matches the brief's End-to-End Example.
-    result = run_support_agent("Where is my order and what are your support hours?")
+    result = run_support_agent(
+        "Where is my order ORD-4471 and what are your support hours?"
+    )
     print("Tool accesses:", result.tool_accesses)
     print("Model:", result.model)
     print("Tokens:", result.input_tokens, result.output_tokens)
+    print("Answer:", result.final_answer)
